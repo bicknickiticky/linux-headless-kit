@@ -81,6 +81,10 @@ class TestAutoOpenWifiLogic(unittest.TestCase):
         self.assertTrue(prof.startswith("auto-open-FreeWiFi_evil_cmd_"))
         self.assertRegex(prof, r"^auto-open-[A-Za-z0-9_-]+$")
 
+    def test_prefers_plasmax11_over_plasma_for_kde6_compatibility(self):
+        chosen = hk.pick_x11_session(["plasma.desktop", "plasmax11.desktop", "fluxbox.desktop"])
+        self.assertEqual(chosen, "plasmax11.desktop")
+
 
 if __name__ == "__main__":
     unittest.main()

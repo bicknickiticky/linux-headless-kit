@@ -332,6 +332,11 @@ def backup_file(path: Path) -> Path | None:
 
 def rebuild_initramfs_with_edid(fw_rel_path: str) -> None:
     """Bundle /lib/firmware/<fw_rel_path> into initramfs across Ubuntu/Debian, Arch, or Fedora."""
+    # Proactively write dracut drop-in so future distro upgrades (e.g. Ubuntu 24.04 -> 26.04 dracut) keep EDID
+    dracut_d = Path("/etc/dracut.conf.d")
+    dracut_d.mkdir(parents=True, exist_ok=True)
+    (dracut_d / "10-headless-edid.conf").write_text(f'install_items+=" /usr/lib/firmware/{fw_rel_path} "\n')
+
     if shutil.which("update-initramfs") and Path("/etc/initramfs-tools").is_dir():
         hook = Path("/etc/initramfs-tools/hooks/edid")
         hook.parent.mkdir(parents=True, exist_ok=True)
@@ -351,9 +356,6 @@ def rebuild_initramfs_with_edid(fw_rel_path: str) -> None:
         (conf_d / "10-headless-edid.conf").write_text(f'FILES+=("/usr/lib/firmware/{fw_rel_path}")\n')
         subprocess.run(["mkinitcpio", "-P"], check=True)
     elif shutil.which("dracut"):
-        conf_d = Path("/etc/dracut.conf.d")
-        conf_d.mkdir(parents=True, exist_ok=True)
-        (conf_d / "10-headless-edid.conf").write_text(f' install_items+=" /usr/lib/firmware/{fw_rel_path} "\n')
         subprocess.run(["dracut", "--regenerate-all", "--force"], check=True)
     else:
         print("[warn] Tidak menemukan update-initramfs / mkinitcpio / dracut; lewati rebuild initramfs.")
@@ -380,20 +382,30 @@ def detect_default_user() -> str | None:
     return None
 
 
+def pick_x11_session(existing_names: list[str] | set[str]) -> str | None:
+    preferred_order = [
+        "plasmax11.desktop",  # KDE Plasma 6 X11 (Ubuntu 26.04+)
+        "plasma.desktop",     # KDE Plasma 5 X11 (Ubuntu 24.04)
+        "ubuntu-xorg.desktop",
+        "ubuntu.desktop",
+        "xfce.desktop",
+        "cinnamon.desktop",
+        "mate.desktop",
+    ]
+    names_set = set(existing_names)
+    for cand in preferred_order:
+        if cand in names_set:
+            return cand
+    sorted_names = sorted(names_set)
+    return sorted_names[0] if sorted_names else None
+
+
 def configure_autologin(user: str) -> None:
     dm_file = Path("/etc/X11/default-display-manager")
     dm = dm_file.read_text().strip() if dm_file.exists() else ""
 
     xsessions = sorted(Path("/usr/share/xsessions").glob("*.desktop")) if Path("/usr/share/xsessions").exists() else []
-    preferred_order = ["plasma.desktop", "ubuntu-xorg.desktop", "ubuntu.desktop", "xfce.desktop", "cinnamon.desktop", "mate.desktop"]
-    session_name = None
-    existing_names = {x.name for x in xsessions}
-    for cand in preferred_order:
-        if cand in existing_names:
-            session_name = cand
-            break
-    if not session_name and xsessions:
-        session_name = xsessions[0].name
+    session_name = pick_x11_session([x.name for x in xsessions])
 
     if "sddm" in dm or Path("/etc/sddm.conf.d").is_dir():
         sddm_dir = Path("/etc/sddm.conf.d")
@@ -471,6 +483,17 @@ def cmd_setup_monitor(args: argparse.Namespace) -> int:
         raise FileNotFoundError("/etc/default/grub tidak ditemukan.")
     backup_file(grub_path)
     grub_path.write_text(update_grub_content(grub_path.read_text(), connector, fw_rel))
+    grub_d = Path("/etc/default/grub.d")
+    if grub_d.is_dir():
+        dropin = grub_d / "98-headless-monitor.cfg"
+        backup_file(dropin)
+        dropin.write_text(
+            "# Survives OS release upgrades even if /etc/default/grub is replaced\n"
+            'case " $GRUB_CMDLINE_LINUX_DEFAULT " in\n'
+            '    *" drm.edid_firmware="*) ;;\n'
+            f'    *) GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT drm.edid_firmware={connector}:{fw_rel} video={connector}:e" ;;\n'
+            "esac\n"
+        )
     print(f"[monitor] Parameter kernel ditambahkan ke {grub_path}: drm.edid_firmware={connector}:{fw_rel} video={connector}:e")
 
     # Anti-DPMS Xorg config
@@ -524,6 +547,7 @@ def cmd_uninstall_monitor(_args: argparse.Namespace) -> int:
         print("[uninstall] Parameter fake monitor dihapus dari /etc/default/grub")
 
     for path_str in [
+        "/etc/default/grub.d/98-headless-monitor.cfg",
         "/etc/initramfs-tools/hooks/edid",
         "/etc/mkinitcpio.conf.d/10-headless-edid.conf",
         "/etc/dracut.conf.d/10-headless-edid.conf",
