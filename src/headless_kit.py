@@ -516,6 +516,34 @@ def cmd_setup_monitor(args: argparse.Namespace) -> int:
         if user:
             configure_autologin(user)
 
+    # Polkit rules for headless/remote sessions (prevents colord boot popups & multi-session shutdown blocks)
+    polkit_dir = Path("/etc/polkit-1/rules.d")
+    if polkit_dir.exists():
+        polkit_rule = polkit_dir / "48-headless-power-and-color.rules"
+        backup_file(polkit_rule)
+        polkit_rule.write_text(
+            "polkit.addRule(function(action, subject) {\n"
+            '    if (!(subject.isInGroup("sudo") || subject.isInGroup("wheel"))) {\n'
+            "        return undefined;\n"
+            "    }\n"
+            '    if (action.id.indexOf("org.freedesktop.color-manager.") === 0 ||\n'
+            '        action.id.indexOf("org.freedesktop.login1.power-off") === 0 ||\n'
+            '        action.id.indexOf("org.freedesktop.login1.reboot") === 0 ||\n'
+            '        action.id.indexOf("org.freedesktop.login1.halt") === 0 ||\n'
+            '        action.id.indexOf("org.freedesktop.login1.suspend") === 0 ||\n'
+            '        action.id.indexOf("org.freedesktop.login1.hibernate") === 0 ||\n'
+            '        action.id === "org.freedesktop.packagekit.system-sources-refresh") {\n'
+            "        return polkit.Result.YES;\n"
+            "    }\n"
+            "});\n"
+        )
+        polkit_rule.chmod(0o644)
+
+    for conf_dir_str, timeout_val in [("/etc/systemd/system.conf.d", "15s"), ("/etc/systemd/user.conf.d", "10s")]:
+        cdir = Path(conf_dir_str)
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "10-fast-shutdown.conf").write_text(f"[Manager]\nDefaultTimeoutStopSec={timeout_val}\n")
+
     rebuild_initramfs_with_edid(fw_rel)
     update_bootloader()
 
@@ -552,6 +580,9 @@ def cmd_uninstall_monitor(_args: argparse.Namespace) -> int:
         "/etc/mkinitcpio.conf.d/10-headless-edid.conf",
         "/etc/dracut.conf.d/10-headless-edid.conf",
         "/etc/X11/xorg.conf.d/10-headless-nodpms.conf",
+        "/etc/polkit-1/rules.d/48-headless-power-and-color.rules",
+        "/etc/systemd/system.conf.d/10-fast-shutdown.conf",
+        "/etc/systemd/user.conf.d/10-fast-shutdown.conf",
     ]:
         p = Path(path_str)
         if p.exists():
