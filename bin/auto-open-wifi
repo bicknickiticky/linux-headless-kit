@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""
+Auto-connect to the strongest available Open Wi-Fi ONLY when no Ethernet (LAN)
+is connected. Works dynamically with any plugged-in Wi-Fi adapter (USB/PCIe).
+"""
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import syslog
+import time
+from pathlib import Path
+
+LOCK_PATH = "/run/auto-open-wifi.lock"
+STATE_DIR = Path("/run/auto-open-wifi")
+FAILED_PATH = STATE_DIR / "failed_ssids.json"
+COOLDOWN_SECONDS = 90
+PROFILE_PREFIX = "auto-open-"
+
+
+def log(msg: str, priority: int = syslog.LOG_INFO) -> None:
+    syslog.openlog("auto-open-wifi", syslog.LOG_PID, syslog.LOG_DAEMON)
+    syslog.syslog(priority, msg)
+    print(msg, flush=True)
+
+
+def run_cmd(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def split_nmcli_escaped(line: str) -> list[str]:
+    fields: list[str] = []
+    buf: list[str] = []
+    esc = False
+    for ch in line:
+        if esc:
+            buf.append(ch)
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            fields.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    fields.append("".join(buf))
+    return fields
+
+
+def valid_ssid(ssid: str) -> bool:
+    if not ssid or not ssid.strip():
+        return False
+    raw = ssid.encode("utf-8", errors="ignore")
+    if not (1 <= len(raw) <= 32):
+        return False
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in ssid):
+        return False
+    return True
+
+
+def make_profile_name(ssid: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", ssid).strip("_")[:18] or "wifi"
+    digest = hashlib.sha256(ssid.encode("utf-8")).hexdigest()[:8]
+    return f"{PROFILE_PREFIX}{slug}-{digest}"
+
+
+def load_failed() -> dict[str, float]:
+    try:
+        data = json.loads(FAILED_PATH.read_text())
+        now = time.time()
+        return {k: float(v) for k, v in data.items() if now - float(v) < COOLDOWN_SECONDS}
+    except Exception:
+        return {}
+
+
+def save_failed(failed: dict[str, float]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    FAILED_PATH.write_text(json.dumps(failed))
+
+
+def get_devices() -> list[dict[str, str]]:
+    res = run_cmd(["nmcli", "-t", "-e", "yes", "-f", "DEVICE,TYPE,STATE,CONNECTION", "dev", "status"])
+    if res.returncode != 0:
+        return []
+    devs = []
+    for line in res.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = split_nmcli_escaped(line)
+        if len(parts) >= 4:
+            devs.append({
+                "device": parts[0],
+                "type": parts[1],
+                "state": parts[2],
+                "connection": parts[3],
+            })
+    return devs
+
+
+def existing_connections() -> set[str]:
+    res = run_cmd(["nmcli", "-t", "-e", "yes", "-f", "NAME", "con", "show"])
+    if res.returncode != 0:
+        return set()
+    return {split_nmcli_escaped(line)[0] for line in res.stdout.splitlines() if line.strip()}
+
+
+def main() -> int:
+    dry_run = "--dry-run" in sys.argv
+
+    os.makedirs("/run", exist_ok=True)
+    lock_fd = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0
+
+    devs = get_devices()
+    eth_devs = [d for d in devs if d["type"] == "ethernet"]
+    wifi_devs = [d for d in devs if d["type"] == "wifi"]
+
+    lan_connected = [d for d in eth_devs if d["state"].startswith("connected")]
+    lan_connecting = [d for d in eth_devs if d["state"].startswith("connecting")]
+
+    if lan_connected:
+        for w in wifi_devs:
+            if w["state"].startswith("connected") and w["connection"].startswith(PROFILE_PREFIX):
+                if dry_run:
+                    log(f"[DRY-RUN] LAN ({lan_connected[0]['device']}) active; would disconnect {w['connection']} on {w['device']}")
+                else:
+                    run_cmd(["nmcli", "dev", "disconnect", w["device"]])
+                    log(f"LAN ({lan_connected[0]['device']}) connected; disconnected temporary open Wi-Fi '{w['connection']}' on {w['device']}")
+        if dry_run:
+            log(f"[DRY-RUN] LAN is connected via {lan_connected[0]['device']} ({lan_connected[0]['connection']}); skipping open Wi-Fi.")
+        return 0
+
+    if lan_connecting:
+        if dry_run:
+            log(f"[DRY-RUN] LAN ({lan_connecting[0]['device']}) is currently obtaining IP; waiting.")
+        return 0
+
+    if not wifi_devs:
+        if dry_run:
+            log("[DRY-RUN] No Wi-Fi adapter detected.")
+        return 0
+
+    radio = run_cmd(["nmcli", "radio", "wifi"]).stdout.strip().lower()
+    if radio == "disabled":
+        if dry_run:
+            log("[DRY-RUN] Wi-Fi radio is disabled; would enable it.")
+        else:
+            log("LAN disconnected and Wi-Fi radio disabled; enabling Wi-Fi radio.")
+            run_cmd(["nmcli", "radio", "wifi", "on"])
+            time.sleep(3)
+            devs = get_devices()
+            wifi_devs = [d for d in devs if d["type"] == "wifi"]
+
+    for w in wifi_devs:
+        if w["state"].startswith("connected") or w["state"].startswith("connecting"):
+            if dry_run:
+                log(f"[DRY-RUN] Wi-Fi {w['device']} already {w['state']} ({w['connection']}).")
+            return 0
+
+    usable_wifi = [
+        w["device"]
+        for w in wifi_devs
+        if not w["state"].startswith("unavailable") and not w["state"].startswith("unmanaged")
+    ]
+    if not usable_wifi:
+        if dry_run:
+            log(f"[DRY-RUN] Wi-Fi adapter(s) not ready yet: {wifi_devs}")
+        return 0
+
+    wifi_dev = usable_wifi[0]
+
+    if not dry_run:
+        run_cmd(["nmcli", "dev", "wifi", "rescan", "ifname", wifi_dev], timeout=15)
+        time.sleep(2)
+
+    scan = run_cmd(
+        ["nmcli", "-t", "-e", "yes", "-f", "IN-USE,SSID,BSSID,SECURITY,SIGNAL", "dev", "wifi", "list", "ifname", wifi_dev, "--rescan", "no"],
+        timeout=20,
+    )
+    if scan.returncode != 0:
+        log(f"Wi-Fi scan failed on {wifi_dev}: {scan.stderr.strip()}", syslog.LOG_WARNING)
+        return 1
+
+    devs_after = get_devices()
+    if any(d["type"] == "ethernet" and d["state"].startswith("connected") for d in devs_after):
+        return 0
+    if any(d["type"] == "wifi" and (d["state"].startswith("connected") or d["state"].startswith("connecting")) for d in devs_after):
+        return 0
+
+    best_open: dict[str, int] = {}
+    for line in scan.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = split_nmcli_escaped(line)
+        if len(parts) < 5:
+            continue
+        _in_use, ssid, _bssid, security, sig_str = parts[0], parts[1], parts[2], parts[3].strip(), parts[4].strip()
+        if not valid_ssid(ssid):
+            continue
+        if security not in ("", "--", "OWE"):
+            continue
+        try:
+            signal = int(sig_str)
+        except ValueError:
+            signal = 0
+        if ssid not in best_open or signal > best_open[ssid]:
+            best_open[ssid] = signal
+
+    if not best_open:
+        if dry_run:
+            log(f"[DRY-RUN] Scanned on {wifi_dev}: 0 open Wi-Fi networks currently in range.")
+        return 0
+
+    failed = load_failed()
+    candidates = sorted(best_open.items(), key=lambda kv: kv[1], reverse=True)
+    ordered = [c for c in candidates if c[0] not in failed] or candidates
+
+    if dry_run:
+        log(f"[DRY-RUN] Open Wi-Fi candidates on {wifi_dev}: {ordered}")
+        return 0
+
+    known_cons = existing_connections()
+    for ssid, signal in ordered:
+        con_name = make_profile_name(ssid)
+        log(f"Attempting auto-connect on {wifi_dev} to open Wi-Fi '{ssid}' (signal {signal}%)")
+
+        if con_name in known_cons:
+            run_cmd([
+                "nmcli", "con", "modify", con_name,
+                "connection.autoconnect", "no",
+                "connection.interface-name", "",
+                "802-11-wireless.mac-address", "",
+                "connection.permissions", "",
+            ])
+            res = run_cmd(["nmcli", "--wait", "25", "con", "up", "id", con_name, "ifname", wifi_dev], timeout=35)
+        else:
+            res = run_cmd(
+                ["nmcli", "--wait", "25", "dev", "wifi", "connect", ssid, "ifname", wifi_dev, "name", con_name],
+                timeout=35,
+            )
+            if con_name in existing_connections():
+                run_cmd([
+                    "nmcli", "con", "modify", con_name,
+                    "connection.autoconnect", "no",
+                    "connection.interface-name", "",
+                    "802-11-wireless.mac-address", "",
+                    "connection.permissions", "",
+                ])
+
+        if res.returncode == 0:
+            failed.pop(ssid, None)
+            save_failed(failed)
+            log(f"Connected to open Wi-Fi '{ssid}' via {wifi_dev} (profile {con_name})")
+            return 0
+
+        log(f"Failed connecting to '{ssid}' on {wifi_dev}: {res.stderr.strip() or res.stdout.strip()}", syslog.LOG_WARNING)
+        failed[ssid] = time.time()
+        save_failed(failed)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
